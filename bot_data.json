@@ -1,0 +1,117 @@
+{
+  "term_data": {
+    "hello": {
+      "count": 1,
+      "last_mentioned": "2025-08-07T19:25:10.144327",
+      "last_user": "lovemymom456",
+      "user_counts": {
+        "lovemymom456": 1
+      }
+    },
+    "THAY": {
+      "count": 2,
+      "last_mentioned": "2025-08-07T19:33:18.844270",
+      "last_user": "lovemymom456",
+      "user_counts": {
+        "lovemymom456": 2
+      }
+    },
+    "chatroom": {
+      "count": 1,
+      "last_mentioned": "2025-08-07T19:39:53.372331",
+      "last_user": "lovemymom456",
+      "user_counts": {
+        "lovemymom456": 1
+      }
+    },
+    "@Crash Can": {
+      "count": 2,
+      "last_mentioned": "2025-08-07T22:27:56.009760",
+      "last_user": "gunt3806",
+      "user_counts": {
+        "lovemymom456": 1,
+        "gunt3806": 1
+      }
+    },
+    "<@146384389754847233>": {
+      "count": 9,
+      "last_mentioned": "2025-08-07T22:27:10.997201",
+      "last_user": "lovemymom456",
+      "user_counts": {
+        "masonjugger": 7,
+        "lovemymom456": 2
+      }
+    },
+    "your*": {
+      "count": 1,
+      "last_mentioned": "2025-08-07T22:33:47.082121",
+      "last_user": "lovemymom456",
+      "user_counts": {
+        "lovemymom456": 1
+      }
+    },
+    "kms": {
+      "count": 2,
+      "last_mentioned": "2025-08-07T22:35:49.735352",
+      "last_user": "lovemymom456",
+      "user_counts": {
+        "lovemymom456": 2
+      }
+    },
+    "KEEPY": {
+      "count": 10,
+      "last_mentioned": "2025-08-07T22:36:37.488699",
+      "last_user": "lovemymom456",
+      "user_counts": {
+        "thanatos07": 3,
+        "lovemymom456": 7
+      }
+    },
+    "keepy*": {
+      "count": 1,
+      "last_mentioned": "2025-08-07T22:36:05.152639",
+      "last_user": "thanatos07",
+      "user_counts": {
+        "thanatos07": 1
+      }
+    },
+    "mreow": {
+      "count": 1,
+      "last_mentioned": "2025-08-08T00:10:40.367728",
+      "last_user": "lovemymom456",
+      "user_counts": {
+        "lovemymom456": 1
+      }
+    }
+  },
+  "tracked_terms": [
+    "hello",
+    "THAY",
+    "KEEPY",
+    "Ursure",
+    "twink",
+    "meow",
+    "mreow",
+    "catroom",
+    "chatroom",
+    "kms",
+    "kys",
+    "@Crash Can",
+    "<@146384389754847233>",
+    "hi Adam",
+    "pmo",
+    "your*",
+    "you're mom*",
+    "cuck*",
+    "keepy*",
+    "binty"
+  ],
+  "forbidden_phrases": [],
+  "timeout_phrases": [
+    "tianmen",
+    "skibidigyattington"
+  ],
+  "keyword_responses": {
+    "tianmen": "https://cdn.theatlantic.com/media/img/photo/2012/06/tiananmen-square-then-and-now/t01_90605094-1/original.jpg"
+  }
+}
