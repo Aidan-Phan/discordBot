@@ -246,7 +246,7 @@ async def migrate_json(db: aiosqlite.Connection):
 # -------------------------
 class TermBot(commands.Bot):
     def __init__(self):
-        super().__init__(command_prefix=COMMAND_PREFIX, intents=intents)
+        super().__init__(command_prefix=COMMAND_PREFIX, intents=intents, help_command=None)
         self.db: aiosqlite.Connection | None = None
         self.patterns: Dict[int, List[Tuple[str, re.Pattern]]] = {}
 
@@ -1195,7 +1195,7 @@ async def cmd_import(ctx: commands.Context):
     await bot.refresh_patterns()
     await ctx.send("✅ Import complete for this server.")
 
-@bot.command(name="help")
+@bot.command(name="help", aliases=["h"])
 async def cmd_help(ctx: commands.Context, command: str = None):
     """Show help information"""
     if command:
