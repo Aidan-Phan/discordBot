@@ -337,9 +337,69 @@ class TermBot(commands.Bot):
 
     async def on_ready(self):
         log.info("Logged in as %s (%s)", self.user, self.user.id)
-        async with self.db.execute("SELECT COUNT(*), COUNT(DISTINCT guild_id) FROM terms") as cur:
-            total_terms, guilds = await cur.fetchone()
-        log.info("Tracking %s term(s) across %s guild(s).", total_terms, guilds)
+        log.info("Connected to %s guild(s): %s", len(self.guilds), [g.name for g in self.guilds])
+        
+        # Get database stats
+        async with self.db.execute("SELECT COUNT(*) FROM terms") as cur:
+            total_terms = (await cur.fetchone())[0]
+        
+        async with self.db.execute("SELECT COUNT(DISTINCT guild_id) FROM terms WHERE guild_id != 0") as cur:
+            active_guilds = (await cur.fetchone())[0]
+            
+        # Check for legacy data (guild_id = 0)
+        async with self.db.execute("SELECT COUNT(*) FROM terms WHERE guild_id = 0") as cur:
+            legacy_terms = (await cur.fetchone())[0]
+        
+        if legacy_terms > 0:
+            log.info("Found %s legacy term(s) from migration (guild_id=0)", legacy_terms)
+        
+        log.info("Tracking %s term(s) across %s guild(s) with active tracking", total_terms, active_guilds)
+        
+        # Clean up data for guilds the bot is no longer in
+        await self.cleanup_orphaned_guilds()
+        
+        # Show per-guild breakdown if in debug mode
+        if log.isEnabledFor(logging.DEBUG):
+            async with self.db.execute("""
+                SELECT guild_id, COUNT(*) as term_count 
+                FROM terms 
+                WHERE guild_id != 0 
+                GROUP BY guild_id 
+                ORDER BY term_count DESC
+            """) as cur:
+                guild_breakdown = await cur.fetchall()
+                
+            for gid, count in guild_breakdown:
+                guild = self.get_guild(gid)
+                guild_name = guild.name if guild else f"Unknown Guild ({gid})"
+                log.debug("Guild '%s': %s terms", guild_name, count)
+
+    async def cleanup_orphaned_guilds(self):
+        """Remove data for guilds the bot is no longer in"""
+        current_guild_ids = {g.id for g in self.guilds}
+        
+        # Find guilds in database that bot is no longer in
+        async with self.db.execute("SELECT DISTINCT guild_id FROM terms WHERE guild_id != 0") as cur:
+            db_guild_ids = {row[0] for row in await cur.fetchall()}
+        
+        orphaned = db_guild_ids - current_guild_ids
+        
+        if orphaned:
+            log.info("Cleaning up data for %s orphaned guild(s): %s", len(orphaned), list(orphaned))
+            for gid in orphaned:
+                await self.db.execute("DELETE FROM terms WHERE guild_id = ?", (gid,))
+                await self.db.execute("DELETE FROM term_meta WHERE guild_id = ?", (gid,))
+                await self.db.execute("DELETE FROM hits WHERE guild_id = ?", (gid,))
+                await self.db.execute("DELETE FROM messages WHERE guild_id = ?", (gid,))
+                await self.db.execute("DELETE FROM guild_settings WHERE guild_id = ?", (gid,))
+                await self.db.execute("DELETE FROM ignored_channels WHERE guild_id = ?", (gid,))
+                await self.db.execute("DELETE FROM user_cooldowns WHERE guild_id = ?", (gid,))
+                await self.db.execute("DELETE FROM forbidden_phrases WHERE guild_id = ?", (gid,))
+                await self.db.execute("DELETE FROM timeout_phrases WHERE guild_id = ?", (gid,))
+                await self.db.execute("DELETE FROM keyword_responses WHERE guild_id = ?", (gid,))
+            
+            await self.db.commit()
+            await self.refresh_patterns()
 
     async def increment(self, message: discord.Message, term: str, occurrences: int = 1):
         gid = self._gid(message)
