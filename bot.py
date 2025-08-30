@@ -4,6 +4,7 @@ import json
 import logging
 from datetime import datetime, timezone, timedelta
 from typing import List, Tuple, Dict, Optional
+from collections import defaultdict
 
 import discord
 from discord.ext import commands
@@ -25,25 +26,17 @@ log = logging.getLogger("term-bot")
 DB_PATH = os.getenv("DB_PATH", "termbot.sqlite3")
 COMMAND_PREFIX = os.getenv("PREFIX", "!")
 
-# Power users (comma-separated Discord user IDs). They bypass admin checks and can run global queries.
+# Power users (comma-separated Discord user IDs)
 POWER_USER_IDS = {
     int(x) for x in os.getenv("POWER_USER_IDS", "").replace(" ", "").split(",") if x.strip().isdigit()
 }
 
-# Case-insensitive matching enforced:
-CASE_SENSITIVE = False
-
-# Path for migration (your existing JSON file)
 JSON_PATH = os.getenv("JSON_PATH", "bot_data.json")
-
-# Ignore terms in bot commands by default
-IGNORE_COMMANDS = os.getenv("IGNORE_COMMANDS", "true").lower() == "true"
 
 intents = discord.Intents.default()
 intents.message_content = True
 intents.messages = True
 intents.guilds = True
-intents.members = False  # not needed
 
 # -------------------------
 # Database schema
@@ -83,38 +76,26 @@ CREATE TABLE IF NOT EXISTS messages (
     content TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
--- per-guild moderation/response config
-CREATE TABLE IF NOT EXISTS forbidden_phrases (
+CREATE TABLE IF NOT EXISTS moderation_actions (
     guild_id INTEGER NOT NULL,
     phrase TEXT NOT NULL,
+    action_type TEXT NOT NULL CHECK(action_type IN ('delete', 'timeout', 'response')),
+    action_value TEXT, -- timeout duration in minutes, or response text
     PRIMARY KEY (guild_id, phrase)
 );
-CREATE TABLE IF NOT EXISTS timeout_phrases (
-    guild_id INTEGER NOT NULL,
-    phrase TEXT NOT NULL,
-    PRIMARY KEY (guild_id, phrase)
-);
-CREATE TABLE IF NOT EXISTS keyword_responses (
-    guild_id INTEGER NOT NULL,
-    keyword TEXT NOT NULL,
-    response TEXT NOT NULL,
-    PRIMARY KEY (guild_id, keyword)
-);
--- New table for ignored channels
 CREATE TABLE IF NOT EXISTS ignored_channels (
     guild_id INTEGER NOT NULL,
     channel_id INTEGER NOT NULL,
     PRIMARY KEY (guild_id, channel_id)
 );
--- New table for guild settings
 CREATE TABLE IF NOT EXISTS guild_settings (
     guild_id INTEGER NOT NULL PRIMARY KEY,
     ignore_commands BOOLEAN DEFAULT true,
     case_sensitive BOOLEAN DEFAULT false,
     min_word_length INTEGER DEFAULT 1,
-    cooldown_seconds INTEGER DEFAULT 0
+    cooldown_seconds INTEGER DEFAULT 0,
+    timeout_duration INTEGER DEFAULT 10
 );
--- New table for user cooldowns
 CREATE TABLE IF NOT EXISTS user_cooldowns (
     guild_id INTEGER NOT NULL,
     user_id INTEGER NOT NULL,
@@ -141,17 +122,14 @@ def build_patterns(terms: List[str], case_sensitive: bool = False) -> List[Tuple
     flags = 0 if case_sensitive else re.IGNORECASE
     patterns = []
     for term in terms:
-        # Use word boundaries for better matching
         pattern = r'\b' + re.escape(term) + r'\b'
         patterns.append((term, re.compile(pattern, flags)))
     return patterns
 
 def is_command_message(content: str, prefix: str) -> bool:
-    """Check if message starts with command prefix"""
     return content.strip().startswith(prefix)
 
 def format_duration(seconds: int) -> str:
-    """Format seconds into human readable duration"""
     if seconds < 60:
         return f"{seconds}s"
     elif seconds < 3600:
@@ -164,12 +142,10 @@ def format_duration(seconds: int) -> str:
 # -------------------------
 # Permissions helpers
 # -------------------------
-
 def is_power_user(user: discord.abc.User) -> bool:
     return user.id in POWER_USER_IDS
 
 def admin_or_power(ctx: commands.Context) -> bool:
-    # Allow if power user, otherwise require guild admin
     if is_power_user(ctx.author):
         return True
     return bool(ctx.guild and ctx.author.guild_permissions.administrator)
@@ -217,32 +193,30 @@ async def migrate_json(db: aiosqlite.Connection):
                 (norm, user, int(cnt or 0), last_mentioned)
             )
 
-    # Persist forbidden phrases (guild_id=0)
+    # Migrate old moderation data to new unified system
     for phrase in (data.get("forbidden_phrases") or []):
         await db.execute(
-            "INSERT OR IGNORE INTO forbidden_phrases(guild_id, phrase) VALUES(0, ?)",
+            "INSERT OR IGNORE INTO moderation_actions(guild_id, phrase, action_type) VALUES(0, ?, 'delete')",
             (normalize_term(phrase),)
         )
 
-    # Persist timeout phrases (guild_id=0)
     for phrase in (data.get("timeout_phrases") or []):
         await db.execute(
-            "INSERT OR IGNORE INTO timeout_phrases(guild_id, phrase) VALUES(0, ?)",
+            "INSERT OR IGNORE INTO moderation_actions(guild_id, phrase, action_type, action_value) VALUES(0, ?, 'timeout', '10')",
             (normalize_term(phrase),)
         )
 
-    # Persist keyword responses (guild_id=0)
     for k, v in (data.get("keyword_responses") or {}).items():
         await db.execute(
-            "INSERT OR REPLACE INTO keyword_responses(guild_id, keyword, response) VALUES(0, ?, ?)",
+            "INSERT OR REPLACE INTO moderation_actions(guild_id, phrase, action_type, action_value) VALUES(0, ?, 'response', ?)",
             (normalize_term(k), str(v))
         )
 
     await db.commit()
-    log.info("Migration from JSON complete. You can keep bot_data.json as a backup or delete it later.")
+    log.info("Migration from JSON complete.")
 
 # -------------------------
-# Bot
+# Bot Class
 # -------------------------
 class TermBot(commands.Bot):
     def __init__(self):
@@ -261,9 +235,8 @@ class TermBot(commands.Bot):
         await self.refresh_patterns()
 
     async def get_guild_settings(self, guild_id: int) -> Dict:
-        """Get guild-specific settings"""
         async with self.db.execute(
-            "SELECT ignore_commands, case_sensitive, min_word_length, cooldown_seconds FROM guild_settings WHERE guild_id=?", 
+            "SELECT ignore_commands, case_sensitive, min_word_length, cooldown_seconds, timeout_duration FROM guild_settings WHERE guild_id=?", 
             (guild_id,)
         ) as cur:
             row = await cur.fetchone()
@@ -273,19 +246,19 @@ class TermBot(commands.Bot):
                 'ignore_commands': bool(row[0]),
                 'case_sensitive': bool(row[1]),
                 'min_word_length': row[2],
-                'cooldown_seconds': row[3]
+                'cooldown_seconds': row[3],
+                'timeout_duration': row[4]
             }
         else:
-            # Return defaults
             return {
                 'ignore_commands': True,
                 'case_sensitive': False,
                 'min_word_length': 1,
-                'cooldown_seconds': 0
+                'cooldown_seconds': 0,
+                'timeout_duration': 10
             }
 
     async def is_channel_ignored(self, guild_id: int, channel_id: int) -> bool:
-        """Check if channel should be ignored"""
         async with self.db.execute(
             "SELECT 1 FROM ignored_channels WHERE guild_id=? AND channel_id=?", 
             (guild_id, channel_id)
@@ -293,7 +266,6 @@ class TermBot(commands.Bot):
             return await cur.fetchone() is not None
 
     async def check_cooldown(self, guild_id: int, user_id: int, term: str, cooldown_seconds: int) -> bool:
-        """Check if user is on cooldown for this term"""
         if cooldown_seconds <= 0:
             return False
             
@@ -311,7 +283,6 @@ class TermBot(commands.Bot):
         return (now - last_time).total_seconds() < cooldown_seconds
 
     async def update_cooldown(self, guild_id: int, user_id: int, term: str):
-        """Update user's cooldown for this term"""
         now = datetime.now(timezone.utc).isoformat()
         await self.db.execute(
             "INSERT OR REPLACE INTO user_cooldowns(guild_id, user_id, term, last_increment) VALUES(?,?,?,?)",
@@ -320,18 +291,15 @@ class TermBot(commands.Bot):
 
     async def refresh_patterns(self):
         self.patterns.clear()
-        # Load all guild/term pairs
         async with self.db.execute("SELECT guild_id, term FROM terms ORDER BY guild_id, term") as cur:
             rows = await cur.fetchall()
-        from collections import defaultdict
+        
         tmp = defaultdict(list)
         for gid, term in rows:
             tmp[gid].append(term)
         
-        # Build patterns for each guild with their settings
         for gid, terms in tmp.items():
             settings = await self.get_guild_settings(gid)
-            # Filter terms by minimum length
             filtered_terms = [t for t in terms if len(t) >= settings['min_word_length']]
             self.patterns[gid] = build_patterns(filtered_terms, settings['case_sensitive'])
 
@@ -339,64 +307,29 @@ class TermBot(commands.Bot):
         log.info("Logged in as %s (%s)", self.user, self.user.id)
         log.info("Connected to %s guild(s): %s", len(self.guilds), [g.name for g in self.guilds])
         
-        # Get database stats
         async with self.db.execute("SELECT COUNT(*) FROM terms") as cur:
             total_terms = (await cur.fetchone())[0]
         
         async with self.db.execute("SELECT COUNT(DISTINCT guild_id) FROM terms WHERE guild_id != 0") as cur:
             active_guilds = (await cur.fetchone())[0]
             
-        # Check for legacy data (guild_id = 0)
-        async with self.db.execute("SELECT COUNT(*) FROM terms WHERE guild_id = 0") as cur:
-            legacy_terms = (await cur.fetchone())[0]
-        
-        if legacy_terms > 0:
-            log.info("Found %s legacy term(s) from migration (guild_id=0)", legacy_terms)
-        
-        log.info("Tracking %s term(s) across %s guild(s) with active tracking", total_terms, active_guilds)
-        
-        # Clean up data for guilds the bot is no longer in
+        log.info("Tracking %s term(s) across %s guild(s)", total_terms, active_guilds)
         await self.cleanup_orphaned_guilds()
-        
-        # Show per-guild breakdown if in debug mode
-        if log.isEnabledFor(logging.DEBUG):
-            async with self.db.execute("""
-                SELECT guild_id, COUNT(*) as term_count 
-                FROM terms 
-                WHERE guild_id != 0 
-                GROUP BY guild_id 
-                ORDER BY term_count DESC
-            """) as cur:
-                guild_breakdown = await cur.fetchall()
-                
-            for gid, count in guild_breakdown:
-                guild = self.get_guild(gid)
-                guild_name = guild.name if guild else f"Unknown Guild ({gid})"
-                log.debug("Guild '%s': %s terms", guild_name, count)
 
     async def cleanup_orphaned_guilds(self):
-        """Remove data for guilds the bot is no longer in"""
         current_guild_ids = {g.id for g in self.guilds}
         
-        # Find guilds in database that bot is no longer in
         async with self.db.execute("SELECT DISTINCT guild_id FROM terms WHERE guild_id != 0") as cur:
             db_guild_ids = {row[0] for row in await cur.fetchall()}
         
         orphaned = db_guild_ids - current_guild_ids
         
         if orphaned:
-            log.info("Cleaning up data for %s orphaned guild(s): %s", len(orphaned), list(orphaned))
+            log.info("Cleaning up data for %s orphaned guild(s)", len(orphaned))
             for gid in orphaned:
-                await self.db.execute("DELETE FROM terms WHERE guild_id = ?", (gid,))
-                await self.db.execute("DELETE FROM term_meta WHERE guild_id = ?", (gid,))
-                await self.db.execute("DELETE FROM hits WHERE guild_id = ?", (gid,))
-                await self.db.execute("DELETE FROM messages WHERE guild_id = ?", (gid,))
-                await self.db.execute("DELETE FROM guild_settings WHERE guild_id = ?", (gid,))
-                await self.db.execute("DELETE FROM ignored_channels WHERE guild_id = ?", (gid,))
-                await self.db.execute("DELETE FROM user_cooldowns WHERE guild_id = ?", (gid,))
-                await self.db.execute("DELETE FROM forbidden_phrases WHERE guild_id = ?", (gid,))
-                await self.db.execute("DELETE FROM timeout_phrases WHERE guild_id = ?", (gid,))
-                await self.db.execute("DELETE FROM keyword_responses WHERE guild_id = ?", (gid,))
+                for table in ['terms', 'term_meta', 'hits', 'messages', 'guild_settings', 
+                             'ignored_channels', 'user_cooldowns', 'moderation_actions']:
+                    await self.db.execute(f"DELETE FROM {table} WHERE guild_id = ?", (gid,))
             
             await self.db.commit()
             await self.refresh_patterns()
@@ -437,26 +370,26 @@ class TermBot(commands.Bot):
 
         gid = message.guild.id if message.guild else 0
         
-        # Check if channel is ignored
         if await self.is_channel_ignored(gid, message.channel.id):
             await self.process_commands(message)
             return
         
-        # Get guild settings
         settings = await self.get_guild_settings(gid)
         
-        # Skip if it's a command and ignore_commands is enabled
         if settings['ignore_commands'] and is_command_message(content, COMMAND_PREFIX):
             await self.process_commands(message)
             return
 
+        # Check for moderation actions FIRST
+        await self.check_moderation_actions(message)
+
+        # Then check for tracked terms
         pats = self.patterns.get(gid, [])
         matched_terms = []
         
         for term, pat in pats:
-            matches = pat.findall(content)  # Find all occurrences
+            matches = pat.findall(content)
             if matches:
-                # Check cooldown
                 if not await self.check_cooldown(gid, message.author.id, term, settings['cooldown_seconds']):
                     count = len(matches)
                     await self.increment(message, term, occurrences=count)
@@ -469,23 +402,87 @@ class TermBot(commands.Bot):
 
         await self.process_commands(message)
 
+    async def check_moderation_actions(self, message: discord.Message):
+        if not message.guild:
+            return
+            
+        gid = message.guild.id
+        content = message.content.lower()
+        
+        async with self.db.execute(
+            "SELECT phrase, action_type, action_value FROM moderation_actions WHERE guild_id=?", 
+            (gid,)
+        ) as cur:
+            actions = await cur.fetchall()
+        
+        for phrase, action_type, action_value in actions:
+            if phrase in content:
+                if action_type == 'delete':
+                    await self._handle_delete_action(message, phrase)
+                elif action_type == 'timeout':
+                    await self._handle_timeout_action(message, phrase, action_value)
+                elif action_type == 'response':
+                    await self._handle_response_action(message, phrase, action_value)
+                    break  # Only respond to first matched keyword
+
+    async def _handle_delete_action(self, message: discord.Message, phrase: str):
+        try:
+            await message.delete()
+            log.info("Deleted message from %s containing forbidden phrase: %s", message.author, phrase)
+            try:
+                await message.author.send(f"Your message in **{message.guild.name}** was deleted because it contained forbidden content.")
+            except discord.Forbidden:
+                pass
+        except discord.Forbidden:
+            log.warning("No permission to delete message in guild %s", message.guild.name)
+
+    async def _handle_timeout_action(self, message: discord.Message, phrase: str, duration_str: str):
+        try:
+            duration = int(duration_str or 10)
+            until = discord.utils.utcnow() + timedelta(minutes=duration)
+            
+            await message.author.timeout(until, reason=f"Used timeout phrase: {phrase}")
+            log.info("Timed out %s for %d minutes for using phrase: %s", message.author, duration, phrase)
+            
+            try:
+                await message.delete()
+            except discord.Forbidden:
+                pass
+            
+            embed = discord.Embed(
+                title="User Timed Out", 
+                description=f"**{message.author.mention}** has been timed out for **{duration} minutes**",
+                color=0xe74c3c
+            )
+            embed.add_field(name="Reason", value=f"Used timeout phrase: `{phrase}`", inline=False)
+            await message.channel.send(embed=embed, delete_after=10)
+            
+        except (discord.Forbidden, discord.HTTPException) as e:
+            log.error("Failed to timeout user %s: %s", message.author, e)
+
+    async def _handle_response_action(self, message: discord.Message, phrase: str, response: str):
+        await message.channel.send(response)
+        log.debug("Sent auto-response for phrase '%s' in guild %s", phrase, message.guild.name)
+
 bot = TermBot()
 
 # -------------------------
-# Commands
+# Standardized Commands
 # -------------------------
+
+# Basic tracking commands
 @bot.command(name="terms")
 async def cmd_terms(ctx: commands.Context):
     """List all tracked terms for this server"""
     gid = ctx.guild.id if ctx.guild else 0
-    terms: List[str] = []
+    terms = []
     async with bot.db.execute("SELECT term FROM terms WHERE guild_id=? ORDER BY term", (gid,)) as cur:
         async for row in cur:
             terms.append(row[0])
+    
     if not terms:
         await ctx.send("No tracked terms yet. Use `!track <term>` to add one.")
     else:
-        # Split into chunks if too long
         terms_text = ", ".join(f"`{t}`" for t in terms)
         if len(terms_text) > 1900:
             chunks = []
@@ -500,11 +497,8 @@ async def cmd_terms(ctx: commands.Context):
             if current_chunk.strip():
                 chunks.append(current_chunk.rstrip(", "))
             
-            for i, chunk in enumerate(chunks):
-                if i == 0:
-                    await ctx.send(chunk)
-                else:
-                    await ctx.send(chunk)
+            for chunk in chunks:
+                await ctx.send(chunk)
         else:
             await ctx.send("**Tracked terms:** " + terms_text)
 
@@ -516,21 +510,20 @@ async def cmd_track(ctx: commands.Context, *, term: str):
     term = normalize_term(term)
     
     if len(term) == 0:
-        await ctx.send("❌ Term cannot be empty.")
+        await ctx.send("Term cannot be empty.")
         return
     
-    # Check if already tracking
     async with bot.db.execute("SELECT 1 FROM terms WHERE guild_id=? AND term=?", (gid, term)) as cur:
         exists = await cur.fetchone()
     
     if exists:
-        await ctx.send(f"⚠️ Already tracking `{term}`.")
+        await ctx.send(f"Already tracking `{term}`.")
         return
         
     await bot.db.execute("INSERT OR IGNORE INTO terms(guild_id, term) VALUES(?, ?)", (gid, term))
     await bot.db.commit()
     await bot.refresh_patterns()
-    await ctx.send(f"✅ Now tracking `{term}`.")
+    await ctx.send(f"Now tracking `{term}`.")
 
 @bot.command(name="untrack")
 @commands.check(admin_or_power)
@@ -539,90 +532,194 @@ async def cmd_untrack(ctx: commands.Context, *, term: str):
     gid = ctx.guild.id if ctx.guild else 0
     term = normalize_term(term)
     
-    # Check if exists first
     async with bot.db.execute("SELECT total_count FROM term_meta WHERE guild_id=? AND term=?", (gid, term)) as cur:
         row = await cur.fetchone()
     
     if not row:
-        await ctx.send(f"❌ `{term}` is not being tracked.")
+        await ctx.send(f"`{term}` is not being tracked.")
         return
     
     total_count = row[0] or 0
     
-    await bot.db.execute("DELETE FROM terms WHERE guild_id=? AND term=?", (gid, term))
-    await bot.db.execute("DELETE FROM term_meta WHERE guild_id=? AND term=?", (gid, term))
-    await bot.db.execute("DELETE FROM hits WHERE guild_id=? AND term=?", (gid, term))
-    await bot.db.execute("DELETE FROM messages WHERE guild_id=? AND term=?", (gid, term))
-    await bot.db.execute("DELETE FROM user_cooldowns WHERE guild_id=? AND term=?", (gid, term))
+    for table in ['terms', 'term_meta', 'hits', 'messages', 'user_cooldowns']:
+        await bot.db.execute(f"DELETE FROM {table} WHERE guild_id=? AND term=?", (gid, term))
+    
     await bot.db.commit()
     await bot.refresh_patterns()
-    await ctx.send(f"🗑️ Removed `{term}` from tracked terms and deleted its stats ({total_count} total mentions).")
+    await ctx.send(f"Removed `{term}` from tracked terms and deleted its stats ({total_count} total mentions).")
 
+# Statistics commands
 @bot.command(name="stats")
 async def cmd_stats(ctx: commands.Context, *, term: str = None):
     """Show statistics for a term or all terms"""
     gid = ctx.guild.id if ctx.guild else 0
     if term:
-        term = normalize_term(term)
-        
-        # Get total count and meta info
-        async with bot.db.execute(
-            "SELECT total_count, last_mentioned, last_user FROM term_meta WHERE guild_id=? AND term=?", 
-            (gid, term)
-        ) as cur:
-            meta_row = await cur.fetchone()
-            
-        if not meta_row:
-            await ctx.send(f"No data yet for `{term}`.")
-            return
-            
-        total_count, last_mentioned, last_user = meta_row
-        
-        # Get top users
-        rows = []
-        async with bot.db.execute(
-            "SELECT user_name, count, last_seen FROM hits WHERE guild_id=? AND term=? ORDER BY count DESC LIMIT 10", 
-            (gid, term)
-        ) as cur:
-            async for r in cur:
-                rows.append(r)
-        
-        if not rows:
-            await ctx.send(f"No user data yet for `{term}`.")
-            return
-        
-        embed = discord.Embed(title=f"📊 Stats for `{term}`", color=0x3498db)
-        embed.add_field(name="Total Mentions", value=total_count, inline=True)
-        
-        if last_mentioned and last_user:
-            try:
-                last_time = datetime.fromisoformat(last_mentioned.replace('Z', '+00:00'))
-                embed.add_field(name="Last Mentioned", value=f"<t:{int(last_time.timestamp())}:R> by {last_user}", inline=False)
-            except:
-                embed.add_field(name="Last Mentioned", value=f"by {last_user}", inline=False)
-        
-        top_users = "\n".join([f"{i+1}. **{user}** — {count}" for i, (user, count, _) in enumerate(rows[:5])])
-        embed.add_field(name="Top Users", value=top_users, inline=False)
-        
-        await ctx.send(embed=embed)
+        await _show_term_stats(ctx, gid, normalize_term(term))
     else:
-        rows = []
+        await _show_all_stats(ctx, gid)
+
+async def _show_term_stats(ctx: commands.Context, gid: int, term: str):
+    async with bot.db.execute(
+        "SELECT total_count, last_mentioned, last_user FROM term_meta WHERE guild_id=? AND term=?", 
+        (gid, term)
+    ) as cur:
+        meta_row = await cur.fetchone()
+        
+    if not meta_row:
+        await ctx.send(f"No data yet for `{term}`.")
+        return
+        
+    total_count, last_mentioned, last_user = meta_row
+    
+    rows = []
+    async with bot.db.execute(
+        "SELECT user_name, count, last_seen FROM hits WHERE guild_id=? AND term=? ORDER BY count DESC LIMIT 5", 
+        (gid, term)
+    ) as cur:
+        async for r in cur:
+            rows.append(r)
+    
+    embed = discord.Embed(title=f"Stats for `{term}`", color=0x3498db)
+    embed.add_field(name="Total Mentions", value=total_count, inline=True)
+    
+    if last_mentioned and last_user:
+        try:
+            last_time = datetime.fromisoformat(last_mentioned.replace('Z', '+00:00'))
+            embed.add_field(name="Last Mentioned", value=f"<t:{int(last_time.timestamp())}:R> by {last_user}", inline=False)
+        except:
+            embed.add_field(name="Last Mentioned", value=f"by {last_user}", inline=False)
+    
+    if rows:
+        top_users = "\n".join([f"{i+1}. **{user}** — {count}" for i, (user, count, _) in enumerate(rows)])
+        embed.add_field(name="Top Users", value=top_users, inline=False)
+    
+    await ctx.send(embed=embed)
+
+async def _show_all_stats(ctx: commands.Context, gid: int):
+    rows = []
+    async with bot.db.execute(
+        "SELECT term, total_count FROM term_meta WHERE guild_id=? ORDER BY total_count DESC LIMIT 10", 
+        (gid,)
+    ) as cur:
+        async for r in cur:
+            rows.append(r)
+            
+    if not rows:
+        await ctx.send("No data yet.")
+        return
+        
+    embed = discord.Embed(title="Top Terms", color=0x3498db)
+    top_terms = "\n".join([f"{i+1}. `{t}` — {c}" for i, (t, c) in enumerate(rows)])
+    embed.description = top_terms
+    await ctx.send(embed=embed)
+
+# Moderation commands - Unified system
+@bot.command(name="moderation", aliases=["mod"])
+async def cmd_moderation(ctx: commands.Context, action: str = None):
+    """Show all moderation actions or help"""
+    gid = ctx.guild.id if ctx.guild else 0
+    
+    if not action:
+        # Show all moderation actions
+        actions = []
         async with bot.db.execute(
-            "SELECT term, total_count FROM term_meta WHERE guild_id=? ORDER BY total_count DESC LIMIT 10", 
+            "SELECT phrase, action_type, action_value FROM moderation_actions WHERE guild_id=? ORDER BY action_type, phrase", 
             (gid,)
         ) as cur:
-            async for r in cur:
-                rows.append(r)
-                
-        if not rows:
-            await ctx.send("No data yet.")
-            return
-            
-        embed = discord.Embed(title="📊 Top Terms", color=0x3498db)
-        top_terms = "\n".join([f"{i+1}. `{t}` — {c}" for i, (t, c) in enumerate(rows)])
-        embed.description = top_terms
+            async for phrase, action_type, action_value in cur:
+                if action_type == 'delete':
+                    actions.append(f"🗑️ `{phrase}` → Delete message")
+                elif action_type == 'timeout':
+                    duration = action_value or "10"
+                    actions.append(f"⏰ `{phrase}` → Timeout for {duration} minutes")
+                elif action_type == 'response':
+                    actions.append(f"💬 `{phrase}` → {action_value}")
+        
+        if not actions:
+            await ctx.send("No moderation actions configured.\n\nUse `!mod help` to see available commands.")
+        else:
+            embed = discord.Embed(title="Moderation Actions", color=0xe74c3c)
+            embed.description = "\n".join(actions[:20])  # Limit for embed size
+            if len(actions) > 20:
+                embed.set_footer(text=f"Showing first 20 of {len(actions)} actions")
+            await ctx.send(embed=embed)
+    
+    elif action == "help":
+        embed = discord.Embed(title="Moderation Commands", color=0x3498db)
+        embed.description = """
+**Available Actions:**
+• `delete` - Delete messages containing the phrase
+• `timeout <minutes>` - Timeout users for specified duration
+• `response <text>` - Send automatic response
+
+**Commands:**
+• `!mod set <phrase> delete` - Delete messages with phrase
+• `!mod set <phrase> timeout 30` - Timeout for 30 minutes
+• `!mod set <phrase> response Hello!` - Auto-respond with "Hello!"
+• `!mod remove <phrase>` - Remove moderation action
+• `!mod` - List all actions
+        """
         await ctx.send(embed=embed)
 
+@bot.command(name="mod_set", aliases=["modset"])
+@commands.check(admin_or_power)
+async def cmd_mod_set(ctx: commands.Context, phrase: str, action_type: str, *, action_value: str = None):
+    """Set a moderation action for a phrase"""
+    gid = ctx.guild.id if ctx.guild else 0
+    phrase = normalize_term(phrase)
+    action_type = action_type.lower()
+    
+    if action_type not in ['delete', 'timeout', 'response']:
+        await ctx.send("Invalid action type. Use: delete, timeout, or response")
+        return
+    
+    if action_type == 'timeout':
+        try:
+            duration = int(action_value) if action_value else 10
+            if duration < 1 or duration > 40320:
+                await ctx.send("Timeout duration must be between 1 and 40320 minutes (28 days).")
+                return
+            action_value = str(duration)
+        except (ValueError, TypeError):
+            await ctx.send("Invalid timeout duration. Please provide a number of minutes.")
+            return
+    
+    elif action_type == 'response' and not action_value:
+        await ctx.send("Response action requires response text.")
+        return
+    
+    await bot.db.execute(
+        "INSERT OR REPLACE INTO moderation_actions(guild_id, phrase, action_type, action_value) VALUES(?,?,?,?)",
+        (gid, phrase, action_type, action_value)
+    )
+    await bot.db.commit()
+    
+    if action_type == 'delete':
+        await ctx.send(f"Set to delete messages containing `{phrase}`.")
+    elif action_type == 'timeout':
+        await ctx.send(f"Set to timeout users for {action_value} minutes when they use `{phrase}`.")
+    elif action_type == 'response':
+        await ctx.send(f"Set auto-response for `{phrase}`: {action_value}")
+
+@bot.command(name="mod_remove", aliases=["modremove"])
+@commands.check(admin_or_power)
+async def cmd_mod_remove(ctx: commands.Context, *, phrase: str):
+    """Remove a moderation action"""
+    gid = ctx.guild.id if ctx.guild else 0
+    phrase = normalize_term(phrase)
+    
+    cur = await bot.db.execute(
+        "DELETE FROM moderation_actions WHERE guild_id=? AND phrase=?",
+        (gid, phrase)
+    )
+    await bot.db.commit()
+    
+    if cur.rowcount:
+        await ctx.send(f"Removed moderation action for `{phrase}`.")
+    else:
+        await ctx.send(f"No moderation action was set for `{phrase}`.")
+
+# Additional commands
 @bot.command(name="recent")
 async def cmd_recent(ctx: commands.Context, term: str = None, limit: int = 5):
     """Show recent messages containing a term"""
@@ -649,7 +746,7 @@ async def cmd_recent(ctx: commands.Context, term: str = None, limit: int = 5):
         return
     
     embed = discord.Embed(
-        title=f"💬 Recent Messages" + (f" for `{term}`" if term else ""), 
+        title=f"Recent Messages" + (f" for `{term}`" if term else ""), 
         color=0x9b59b6
     )
     
@@ -666,7 +763,6 @@ async def cmd_recent(ctx: commands.Context, term: str = None, limit: int = 5):
         except:
             time_str = "recently"
             
-        # Truncate content if too long
         display_content = content[:100] + "..." if len(content) > 100 else content
         
         channel = ctx.guild.get_channel(channel_id) if ctx.guild else None
@@ -680,148 +776,11 @@ async def cmd_recent(ctx: commands.Context, term: str = None, limit: int = 5):
     
     await ctx.send(embed=embed)
 
-# -------------------------
-# Settings Commands
-# -------------------------
-@bot.command(name="settings")
-@commands.check(admin_or_power)
-async def cmd_settings(ctx: commands.Context):
-    """Show current guild settings"""
-    gid = ctx.guild.id if ctx.guild else 0
-    settings = await bot.get_guild_settings(gid)
-    
-    embed = discord.Embed(title="⚙️ Guild Settings", color=0x2ecc71)
-    embed.add_field(name="Ignore Commands", value="✅ Yes" if settings['ignore_commands'] else "❌ No", inline=True)
-    embed.add_field(name="Case Sensitive", value="✅ Yes" if settings['case_sensitive'] else "❌ No", inline=True)
-    embed.add_field(name="Min Word Length", value=settings['min_word_length'], inline=True)
-    embed.add_field(name="Cooldown", value=f"{settings['cooldown_seconds']}s" if settings['cooldown_seconds'] > 0 else "Disabled", inline=True)
-    
-    # Show ignored channels
-    ignored = []
-    async with bot.db.execute("SELECT channel_id FROM ignored_channels WHERE guild_id=?", (gid,)) as cur:
-        async for row in cur:
-            channel = ctx.guild.get_channel(row[0]) if ctx.guild else None
-            if channel:
-                ignored.append(f"#{channel.name}")
-    
-    if ignored:
-        embed.add_field(name="Ignored Channels", value=", ".join(ignored), inline=False)
-    
-    await ctx.send(embed=embed)
-
-@bot.command(name="set")
-@commands.check(admin_or_power)
-async def cmd_set(ctx: commands.Context, setting: str, value: str):
-    """Change a guild setting"""
-    gid = ctx.guild.id if ctx.guild else 0
-    setting = setting.lower()
-    
-    # Initialize settings if they don't exist
-    await bot.db.execute(
-        "INSERT OR IGNORE INTO guild_settings(guild_id) VALUES(?)", (gid,)
-    )
-    
-    if setting in ["ignore_commands", "ignore_command"]:
-        bool_val = value.lower() in ["true", "yes", "1", "on", "enable"]
-        await bot.db.execute(
-            "UPDATE guild_settings SET ignore_commands=? WHERE guild_id=?",
-            (bool_val, gid)
-        )
-        await ctx.send(f"✅ Commands will {'not ' if not bool_val else ''}be ignored for term tracking.")
-        
-    elif setting in ["case_sensitive", "case"]:
-        bool_val = value.lower() in ["true", "yes", "1", "on", "enable"]
-        await bot.db.execute(
-            "UPDATE guild_settings SET case_sensitive=? WHERE guild_id=?",
-            (bool_val, gid)
-        )
-        await bot.refresh_patterns()
-        await ctx.send(f"✅ Term matching is now {'case sensitive' if bool_val else 'case insensitive'}.")
-        
-    elif setting in ["min_word_length", "min_length", "minlength"]:
-        try:
-            int_val = int(value)
-            if int_val < 1:
-                await ctx.send("❌ Minimum word length must be at least 1.")
-                return
-            await bot.db.execute(
-                "UPDATE guild_settings SET min_word_length=? WHERE guild_id=?",
-                (int_val, gid)
-            )
-            await bot.refresh_patterns()
-            await ctx.send(f"✅ Minimum word length set to {int_val}.")
-        except ValueError:
-            await ctx.send("❌ Please provide a valid number.")
-            
-    elif setting in ["cooldown", "cooldown_seconds"]:
-        try:
-            int_val = int(value)
-            if int_val < 0:
-                await ctx.send("❌ Cooldown cannot be negative.")
-                return
-            await bot.db.execute(
-                "UPDATE guild_settings SET cooldown_seconds=? WHERE guild_id=?",
-                (int_val, gid)
-            )
-            if int_val == 0:
-                await ctx.send("✅ Cooldown disabled.")
-            else:
-                await ctx.send(f"✅ Cooldown set to {format_duration(int_val)}.")
-        except ValueError:
-            await ctx.send("❌ Please provide a valid number of seconds.")
-    else:
-        await ctx.send("❌ Unknown setting. Available: ignore_commands, case_sensitive, min_word_length, cooldown")
-        return
-    
-    await bot.db.commit()
-
-@bot.command(name="ignore_channel")
-@commands.check(admin_or_power)
-async def cmd_ignore_channel(ctx: commands.Context, channel: discord.TextChannel = None):
-    """Add a channel to ignore list"""
-    if not channel:
-        channel = ctx.channel
-    
-    gid = ctx.guild.id if ctx.guild else 0
-    
-    # Check if already ignored
-    if await bot.is_channel_ignored(gid, channel.id):
-        await ctx.send(f"⚠️ #{channel.name} is already being ignored.")
-        return
-    
-    await bot.db.execute(
-        "INSERT INTO ignored_channels(guild_id, channel_id) VALUES(?, ?)",
-        (gid, channel.id)
-    )
-    await bot.db.commit()
-    await ctx.send(f"✅ Now ignoring #{channel.name} for term tracking.")
-
-@bot.command(name="unignore_channel")
-@commands.check(admin_or_power)
-async def cmd_unignore_channel(ctx: commands.Context, channel: discord.TextChannel = None):
-    """Remove a channel from ignore list"""
-    if not channel:
-        channel = ctx.channel
-    
-    gid = ctx.guild.id if ctx.guild else 0
-    
-    cur = await bot.db.execute(
-        "DELETE FROM ignored_channels WHERE guild_id=? AND channel_id=?",
-        (gid, channel.id)
-    )
-    await bot.db.commit()
-    
-    if cur.rowcount:
-        await ctx.send(f"✅ No longer ignoring #{channel.name}.")
-    else:
-        await ctx.send(f"⚠️ #{channel.name} wasn't being ignored.")
-
 @bot.command(name="leaderboard", aliases=["lb", "top"])
 async def cmd_leaderboard(ctx: commands.Context, timeframe: str = "all"):
     """Show user leaderboard for all terms"""
     gid = ctx.guild.id if ctx.guild else 0
     
-    # Parse timeframe
     where_clause = ""
     params = [gid]
     
@@ -857,7 +816,7 @@ async def cmd_leaderboard(ctx: commands.Context, timeframe: str = "all"):
         return
     
     embed = discord.Embed(
-        title=f"🏆 Leaderboard ({timeframe.title()})",
+        title=f"Leaderboard ({timeframe.title()})",
         color=0xf1c40f
     )
     
@@ -882,10 +841,9 @@ async def cmd_search(ctx: commands.Context, *, query: str):
     gid = ctx.guild.id if ctx.guild else 0
     
     if len(query) < 2:
-        await ctx.send("❌ Search query must be at least 2 characters.")
+        await ctx.send("Search query must be at least 2 characters.")
         return
     
-    # Use LIKE for partial matching
     search_query = f"%{query.lower()}%"
     
     async with bot.db.execute(
@@ -903,7 +861,7 @@ async def cmd_search(ctx: commands.Context, *, query: str):
         return
     
     embed = discord.Embed(
-        title=f"🔍 Search Results for: `{query}`",
+        title=f"Search Results for: `{query}`",
         color=0xe74c3c
     )
     
@@ -914,7 +872,6 @@ async def cmd_search(ctx: commands.Context, *, query: str):
         except:
             time_str = "recently"
         
-        # Highlight the search term in content
         display_content = content[:150] + "..." if len(content) > 150 else content
         
         channel = ctx.guild.get_channel(channel_id) if ctx.guild else None
@@ -928,6 +885,129 @@ async def cmd_search(ctx: commands.Context, *, query: str):
     
     await ctx.send(embed=embed)
 
+# Settings commands
+@bot.command(name="settings")
+@commands.check(admin_or_power)
+async def cmd_settings(ctx: commands.Context):
+    """Show current guild settings"""
+    gid = ctx.guild.id if ctx.guild else 0
+    settings = await bot.get_guild_settings(gid)
+    
+    embed = discord.Embed(title="Guild Settings", color=0x2ecc71)
+    embed.add_field(name="Ignore Commands", value="Yes" if settings['ignore_commands'] else "No", inline=True)
+    embed.add_field(name="Case Sensitive", value="Yes" if settings['case_sensitive'] else "No", inline=True)
+    embed.add_field(name="Min Word Length", value=settings['min_word_length'], inline=True)
+    embed.add_field(name="Cooldown", value=f"{settings['cooldown_seconds']}s" if settings['cooldown_seconds'] > 0 else "Disabled", inline=True)
+    embed.add_field(name="Timeout Duration", value=f"{settings['timeout_duration']} minutes", inline=True)
+    
+    ignored = []
+    async with bot.db.execute("SELECT channel_id FROM ignored_channels WHERE guild_id=?", (gid,)) as cur:
+        async for row in cur:
+            channel = ctx.guild.get_channel(row[0]) if ctx.guild else None
+            if channel:
+                ignored.append(f"#{channel.name}")
+    
+    if ignored:
+        embed.add_field(name="Ignored Channels", value=", ".join(ignored), inline=False)
+    
+    await ctx.send(embed=embed)
+
+@bot.command(name="set")
+@commands.check(admin_or_power)
+async def cmd_set(ctx: commands.Context, setting: str, value: str):
+    """Change a guild setting"""
+    gid = ctx.guild.id if ctx.guild else 0
+    setting = setting.lower()
+    
+    await bot.db.execute("INSERT OR IGNORE INTO guild_settings(guild_id) VALUES(?)", (gid,))
+    
+    if setting in ["ignore_commands", "ignore_command"]:
+        bool_val = value.lower() in ["true", "yes", "1", "on", "enable"]
+        await bot.db.execute("UPDATE guild_settings SET ignore_commands=? WHERE guild_id=?", (bool_val, gid))
+        await ctx.send(f"Commands will {'not ' if not bool_val else ''}be ignored for term tracking.")
+        
+    elif setting in ["case_sensitive", "case"]:
+        bool_val = value.lower() in ["true", "yes", "1", "on", "enable"]
+        await bot.db.execute("UPDATE guild_settings SET case_sensitive=? WHERE guild_id=?", (bool_val, gid))
+        await bot.refresh_patterns()
+        await ctx.send(f"Term matching is now {'case sensitive' if bool_val else 'case insensitive'}.")
+        
+    elif setting in ["min_word_length", "min_length", "minlength"]:
+        try:
+            int_val = int(value)
+            if int_val < 1:
+                await ctx.send("Minimum word length must be at least 1.")
+                return
+            await bot.db.execute("UPDATE guild_settings SET min_word_length=? WHERE guild_id=?", (int_val, gid))
+            await bot.refresh_patterns()
+            await ctx.send(f"Minimum word length set to {int_val}.")
+        except ValueError:
+            await ctx.send("Please provide a valid number.")
+            
+    elif setting in ["cooldown", "cooldown_seconds"]:
+        try:
+            int_val = int(value)
+            if int_val < 0:
+                await ctx.send("Cooldown cannot be negative.")
+                return
+            await bot.db.execute("UPDATE guild_settings SET cooldown_seconds=? WHERE guild_id=?", (int_val, gid))
+            if int_val == 0:
+                await ctx.send("Cooldown disabled.")
+            else:
+                await ctx.send(f"Cooldown set to {format_duration(int_val)}.")
+        except ValueError:
+            await ctx.send("Please provide a valid number of seconds.")
+            
+    elif setting in ["timeout_duration", "timeout", "timeout_minutes"]:
+        try:
+            int_val = int(value)
+            if int_val < 1 or int_val > 40320:
+                await ctx.send("Timeout duration must be between 1 and 40320 minutes (28 days).")
+                return
+            await bot.db.execute("UPDATE guild_settings SET timeout_duration=? WHERE guild_id=?", (int_val, gid))
+            await ctx.send(f"Timeout duration set to {int_val} minutes.")
+        except ValueError:
+            await ctx.send("Please provide a valid number of minutes.")
+    else:
+        await ctx.send("Unknown setting. Available: ignore_commands, case_sensitive, min_word_length, cooldown, timeout_duration")
+        return
+    
+    await bot.db.commit()
+
+@bot.command(name="ignore_channel")
+@commands.check(admin_or_power)
+async def cmd_ignore_channel(ctx: commands.Context, channel: discord.TextChannel = None):
+    """Add a channel to ignore list"""
+    if not channel:
+        channel = ctx.channel
+    
+    gid = ctx.guild.id if ctx.guild else 0
+    
+    if await bot.is_channel_ignored(gid, channel.id):
+        await ctx.send(f"#{channel.name} is already being ignored.")
+        return
+    
+    await bot.db.execute("INSERT INTO ignored_channels(guild_id, channel_id) VALUES(?, ?)", (gid, channel.id))
+    await bot.db.commit()
+    await ctx.send(f"Now ignoring #{channel.name} for term tracking.")
+
+@bot.command(name="unignore_channel")
+@commands.check(admin_or_power)
+async def cmd_unignore_channel(ctx: commands.Context, channel: discord.TextChannel = None):
+    """Remove a channel from ignore list"""
+    if not channel:
+        channel = ctx.channel
+    
+    gid = ctx.guild.id if ctx.guild else 0
+    
+    cur = await bot.db.execute("DELETE FROM ignored_channels WHERE guild_id=? AND channel_id=?", (gid, channel.id))
+    await bot.db.commit()
+    
+    if cur.rowcount:
+        await ctx.send(f"No longer ignoring #{channel.name}.")
+    else:
+        await ctx.send(f"#{channel.name} wasn't being ignored.")
+
 @bot.command(name="reset")
 @commands.check(admin_or_power)
 async def cmd_reset(ctx: commands.Context, *, term: str = None):
@@ -937,178 +1017,57 @@ async def cmd_reset(ctx: commands.Context, *, term: str = None):
     if term:
         term = normalize_term(term)
         
-        # Check if term exists
         async with bot.db.execute("SELECT total_count FROM term_meta WHERE guild_id=? AND term=?", (gid, term)) as cur:
             row = await cur.fetchone()
         
         if not row:
-            await ctx.send(f"❌ `{term}` is not being tracked.")
+            await ctx.send(f"`{term}` is not being tracked.")
             return
         
         total_count = row[0] or 0
         
-        # Reset the stats but keep the term tracked
-        await bot.db.execute("DELETE FROM term_meta WHERE guild_id=? AND term=?", (gid, term))
-        await bot.db.execute("DELETE FROM hits WHERE guild_id=? AND term=?", (gid, term))
-        await bot.db.execute("DELETE FROM messages WHERE guild_id=? AND term=?", (gid, term))
-        await bot.db.execute("DELETE FROM user_cooldowns WHERE guild_id=? AND term=?", (gid, term))
-        await bot.db.commit()
+        for table in ['term_meta', 'hits', 'messages', 'user_cooldowns']:
+            await bot.db.execute(f"DELETE FROM {table} WHERE guild_id=? AND term=?", (gid, term))
         
-        await ctx.send(f"✅ Reset statistics for `{term}` ({total_count} mentions cleared).")
+        await bot.db.commit()
+        await ctx.send(f"Reset statistics for `{term}` ({total_count} mentions cleared).")
     else:
-        # Reset all terms for this guild
         async with bot.db.execute("SELECT COUNT(*) FROM messages WHERE guild_id=?", (gid,)) as cur:
             total_messages = (await cur.fetchone())[0]
         
-        await bot.db.execute("DELETE FROM term_meta WHERE guild_id=?", (gid,))
-        await bot.db.execute("DELETE FROM hits WHERE guild_id=?", (gid,))
-        await bot.db.execute("DELETE FROM messages WHERE guild_id=?", (gid,))
-        await bot.db.execute("DELETE FROM user_cooldowns WHERE guild_id=?", (gid,))
-        await bot.db.commit()
+        for table in ['term_meta', 'hits', 'messages', 'user_cooldowns']:
+            await bot.db.execute(f"DELETE FROM {table} WHERE guild_id=?", (gid,))
         
-        await ctx.send(f"✅ Reset all statistics for this server ({total_messages} total messages cleared).")
+        await bot.db.commit()
+        await ctx.send(f"Reset all statistics for this server ({total_messages} total messages cleared).")
 
-# -------------------------
-# Additional Moderation/Response Commands
-# -------------------------
-
-@bot.command(name="forbidden")
-async def cmd_forbidden(ctx: commands.Context):
-    """List forbidden phrases"""
-    gid = ctx.guild.id if ctx.guild else 0
-    phrases = []
-    async with bot.db.execute("SELECT phrase FROM forbidden_phrases WHERE guild_id=? ORDER BY phrase", (gid,)) as cur:
-        async for r in cur:
-            phrases.append(r[0])
-    if not phrases:
-        await ctx.send("No forbidden phrases configured.")
-    else:
-        await ctx.send("**Forbidden phrases:** " + ", ".join(f"`{p}`" for p in phrases))
-
-@bot.command(name="timeouts")
-async def cmd_timeouts(ctx: commands.Context):
-    """List timeout phrases"""
-    gid = ctx.guild.id if ctx.guild else 0
-    phrases = []
-    async with bot.db.execute("SELECT phrase FROM timeout_phrases WHERE guild_id=? ORDER BY phrase", (gid,)) as cur:
-        async for r in cur:
-            phrases.append(r[0])
-    if not phrases:
-        await ctx.send("No timeout phrases configured.")
-    else:
-        await ctx.send("**Timeout phrases:** " + ", ".join(f"`{p}`" for p in phrases))
-
-@bot.command(name="responses")
-async def cmd_responses(ctx: commands.Context):
-    """List keyword responses"""
-    gid = ctx.guild.id if ctx.guild else 0
-    pairs = []
-    async with bot.db.execute("SELECT keyword, response FROM keyword_responses WHERE guild_id=? ORDER BY keyword", (gid,)) as cur:
-        async for r in cur:
-            pairs.append((r[0], r[1]))
-    if not pairs:
-        await ctx.send("No keyword responses configured.")
-    else:
-        lines = [f"`{k}` → {v}" for k, v in pairs[:25]]
-        await ctx.send("**Keyword responses:**\n" + "\n".join(lines))
-
-@bot.command(name="forbidden_add")
-@commands.check(admin_or_power)
-async def cmd_forbidden_add(ctx: commands.Context, *, phrase: str):
-    """Add a forbidden phrase"""
-    gid = ctx.guild.id if ctx.guild else 0
-    phrase = normalize_term(phrase)
-    await bot.db.execute("INSERT OR IGNORE INTO forbidden_phrases(guild_id, phrase) VALUES(?, ?)", (gid, phrase))
-    await bot.db.commit()
-    await ctx.send(f"✅ Added forbidden phrase `{phrase}` for this server.")
-
-@bot.command(name="forbidden_remove")
-@commands.check(admin_or_power)
-async def cmd_forbidden_remove(ctx: commands.Context, *, phrase: str):
-    """Remove a forbidden phrase"""
-    gid = ctx.guild.id if ctx.guild else 0
-    phrase = normalize_term(phrase)
-    cur = await bot.db.execute("DELETE FROM forbidden_phrases WHERE guild_id=? AND phrase=?", (gid, phrase))
-    await bot.db.commit()
-    if cur.rowcount:
-        await ctx.send(f"🗑️ Removed `{phrase}` from forbidden phrases.")
-    else:
-        await ctx.send(f"`{phrase}` was not in forbidden phrases.")
-
-@bot.command(name="timeouts_add")
-@commands.check(admin_or_power)
-async def cmd_timeouts_add(ctx: commands.Context, *, phrase: str):
-    """Add a timeout phrase"""
-    gid = ctx.guild.id if ctx.guild else 0
-    phrase = normalize_term(phrase)
-    await bot.db.execute("INSERT OR IGNORE INTO timeout_phrases(guild_id, phrase) VALUES(?, ?)", (gid, phrase))
-    await bot.db.commit()
-    await ctx.send(f"✅ Added timeout phrase `{phrase}` for this server.")
-
-@bot.command(name="timeouts_remove")
-@commands.check(admin_or_power)
-async def cmd_timeouts_remove(ctx: commands.Context, *, phrase: str):
-    """Remove a timeout phrase"""
-    gid = ctx.guild.id if ctx.guild else 0
-    phrase = normalize_term(phrase)
-    cur = await bot.db.execute("DELETE FROM timeout_phrases WHERE guild_id=? AND phrase=?", (gid, phrase))
-    await bot.db.commit()
-    if cur.rowcount:
-        await ctx.send(f"🗑️ Removed `{phrase}` from timeout phrases.")
-    else:
-        await ctx.send(f"`{phrase}` was not in timeout phrases.")
-
-@bot.command(name="response_set")
-@commands.check(admin_or_power)
-async def cmd_response_set(ctx: commands.Context, keyword: str, *, response: str):
-    """Set a keyword response"""
-    gid = ctx.guild.id if ctx.guild else 0
-    keyword = normalize_term(keyword)
-    await bot.db.execute(
-        "INSERT OR REPLACE INTO keyword_responses(guild_id, keyword, response) VALUES(?,?,?)",
-        (gid, keyword, response)
-    )
-    await bot.db.commit()
-    await ctx.send(f"✅ Set response for `{keyword}`.")
-
-@bot.command(name="response_unset")
-@commands.check(admin_or_power)
-async def cmd_response_unset(ctx: commands.Context, *, keyword: str):
-    """Remove a keyword response"""
-    gid = ctx.guild.id if ctx.guild else 0
-    keyword = normalize_term(keyword)
-    cur = await bot.db.execute("DELETE FROM keyword_responses WHERE guild_id=? AND keyword=?", (gid, keyword))
-    await bot.db.commit()
-    if cur.rowcount:
-        await ctx.send(f"🗑️ Removed response for `{keyword}`.")
-    else:
-        await ctx.send(f"No response was set for `{keyword}`.")
-
+# Import/Export commands
 @bot.command(name="export")
 @commands.check(admin_or_power)
 async def cmd_export(ctx: commands.Context):
     """Export all data for this server"""
-    import json, tempfile, os
+    import tempfile
     gid = ctx.guild.id if ctx.guild else 0
 
-    # tracked terms
+    # Collect all data
     terms = []
     async with bot.db.execute("SELECT term FROM terms WHERE guild_id=? ORDER BY term", (gid,)) as cur:
         async for r in cur:
             terms.append(r[0])
 
-    # term meta + user counts
     term_data = {}
     for term in terms:
-        meta = await bot.db.execute_fetchone(
+        async with bot.db.execute(
             "SELECT total_count, last_mentioned, last_user FROM term_meta WHERE guild_id=? AND term=?",
             (gid, term)
-        )
+        ) as cur:
+            meta = await cur.fetchone()
+        
         if meta:
             total, last_mentioned, last_user = meta
         else:
             total, last_mentioned, last_user = 0, None, None
-        # per-user breakdown
+        
         users = []
         async with bot.db.execute(
             "SELECT user_id, user_name, count, last_seen FROM hits WHERE guild_id=? AND term=? ORDER BY count DESC",
@@ -1116,6 +1075,7 @@ async def cmd_export(ctx: commands.Context):
         ) as cur:
             async for uid, uname, cnt, last_seen in cur:
                 users.append({"user_id": uid, "user_name": uname, "count": cnt, "last_seen": last_seen})
+        
         term_data[term] = {
             "count": total,
             "last_mentioned": last_mentioned,
@@ -1123,26 +1083,18 @@ async def cmd_export(ctx: commands.Context):
             "user_counts": users,
         }
 
-    # forbidden/timeout/responses
-    forbidden = []
-    async with bot.db.execute("SELECT phrase FROM forbidden_phrases WHERE guild_id=? ORDER BY phrase", (gid,)) as cur:
-        async for r in cur:
-            forbidden.append(r[0])
-    
-    timeouts = []
-    async with bot.db.execute("SELECT phrase FROM timeout_phrases WHERE guild_id=? ORDER BY phrase", (gid,)) as cur:
-        async for r in cur:
-            timeouts.append(r[0])
-    
-    responses = []
-    async with bot.db.execute("SELECT keyword, response FROM keyword_responses WHERE guild_id=? ORDER BY keyword", (gid,)) as cur:
-        async for k, v in cur:
-            responses.append({"keyword": k, "response": v})
+    # Moderation actions
+    moderation = []
+    async with bot.db.execute(
+        "SELECT phrase, action_type, action_value FROM moderation_actions WHERE guild_id=? ORDER BY phrase", 
+        (gid,)
+    ) as cur:
+        async for phrase, action_type, action_value in cur:
+            moderation.append({"phrase": phrase, "action_type": action_type, "action_value": action_value})
 
-    # settings
+    # Settings and ignored channels
     settings = await bot.get_guild_settings(gid)
     
-    # ignored channels
     ignored_channels = []
     async with bot.db.execute("SELECT channel_id FROM ignored_channels WHERE guild_id=?", (gid,)) as cur:
         async for r in cur:
@@ -1153,9 +1105,7 @@ async def cmd_export(ctx: commands.Context):
         "export_date": datetime.now(timezone.utc).isoformat(),
         "tracked_terms": terms,
         "term_data": term_data,
-        "forbidden_phrases": forbidden,
-        "timeout_phrases": timeouts,
-        "keyword_responses": responses,
+        "moderation_actions": moderation,
         "settings": settings,
         "ignored_channels": ignored_channels
     }
@@ -1167,32 +1117,31 @@ async def cmd_export(ctx: commands.Context):
         json.dump(payload, fp, indent=2)
         tmp_path = fp.name
     
-    await ctx.send("📤 Server data export:", file=discord.File(tmp_path, filename=filename))
+    await ctx.send("Server data export:", file=discord.File(tmp_path, filename=filename))
     os.unlink(tmp_path)
 
 @bot.command(name="import")
 @commands.check(admin_or_power)
 async def cmd_import(ctx: commands.Context):
     """Import data from an export file"""
-    import json
     gid = ctx.guild.id if ctx.guild else 0
     if not ctx.message.attachments:
-        await ctx.send("❌ Attach a JSON export file to import.")
+        await ctx.send("Attach a JSON export file to import.")
         return
     
     try:
         data_bytes = await ctx.message.attachments[0].read()
         data = json.loads(data_bytes.decode("utf-8"))
     except Exception as e:
-        await ctx.send(f"❌ Couldn't parse JSON: {e}")
+        await ctx.send(f"Couldn't parse JSON: {e}")
         return
 
-    # Terms
+    # Import terms
     for term in (data.get("tracked_terms") or []):
         term = normalize_term(term)
         await bot.db.execute("INSERT OR IGNORE INTO terms(guild_id, term) VALUES(?, ?)", (gid, term))
 
-    # Term data
+    # Import term data
     term_data = data.get("term_data") or {}
     for term, info in term_data.items():
         term = normalize_term(term)
@@ -1204,7 +1153,8 @@ async def cmd_import(ctx: commands.Context):
             "ON CONFLICT(guild_id, term) DO UPDATE SET total_count=excluded.total_count, last_mentioned=excluded.last_mentioned, last_user=excluded.last_user",
             (gid, term, total, last_mentioned, last_user)
         )
-        # user_counts can be a dict (old) or list of objects (new)
+        
+        # Handle user counts (both old dict format and new list format)
         uc = info.get("user_counts") or {}
         if isinstance(uc, dict):
             for uname, cnt in uc.items():
@@ -1225,27 +1175,28 @@ async def cmd_import(ctx: commands.Context):
                     (gid, term, uid, uname, cnt, last_seen)
                 )
 
-    # Forbidden/Timeout/Responses
-    for p in (data.get("forbidden_phrases") or []):
-        await bot.db.execute("INSERT OR IGNORE INTO forbidden_phrases(guild_id, phrase) VALUES(?, ?)", (gid, normalize_term(p)))
-    for p in (data.get("timeout_phrases") or []):
-        await bot.db.execute("INSERT OR IGNORE INTO timeout_phrases(guild_id, phrase) VALUES(?, ?)", (gid, normalize_term(p)))
-    for kv in (data.get("keyword_responses") or []):
-        k = normalize_term(kv.get("keyword", ""))
-        v = str(kv.get("response", ""))
-        if k:
-            await bot.db.execute("INSERT OR REPLACE INTO keyword_responses(guild_id, keyword, response) VALUES(?, ?, ?)", (gid, k, v))
+    # Import moderation actions
+    for action in (data.get("moderation_actions") or []):
+        phrase = normalize_term(action.get("phrase", ""))
+        action_type = action.get("action_type")
+        action_value = action.get("action_value")
+        if phrase and action_type:
+            await bot.db.execute(
+                "INSERT OR REPLACE INTO moderation_actions(guild_id, phrase, action_type, action_value) VALUES(?,?,?,?)",
+                (gid, phrase, action_type, action_value)
+            )
 
-    # Settings
+    # Import settings
     settings_data = data.get("settings", {})
     if settings_data:
         await bot.db.execute(
-            "INSERT OR REPLACE INTO guild_settings(guild_id, ignore_commands, case_sensitive, min_word_length, cooldown_seconds) VALUES(?,?,?,?,?)",
+            "INSERT OR REPLACE INTO guild_settings(guild_id, ignore_commands, case_sensitive, min_word_length, cooldown_seconds, timeout_duration) VALUES(?,?,?,?,?,?)",
             (gid, settings_data.get("ignore_commands", True), settings_data.get("case_sensitive", False), 
-             settings_data.get("min_word_length", 1), settings_data.get("cooldown_seconds", 0))
+             settings_data.get("min_word_length", 1), settings_data.get("cooldown_seconds", 0), 
+             settings_data.get("timeout_duration", 10))
         )
 
-    # Ignored channels (only if they still exist)
+    # Import ignored channels (only if they still exist)
     if ctx.guild:
         for channel_id in (data.get("ignored_channels") or []):
             if ctx.guild.get_channel(channel_id):
@@ -1253,16 +1204,16 @@ async def cmd_import(ctx: commands.Context):
 
     await bot.db.commit()
     await bot.refresh_patterns()
-    await ctx.send("✅ Import complete for this server.")
+    await ctx.send("Import complete for this server.")
 
+# Help command
 @bot.command(name="help", aliases=["h"])
 async def cmd_help(ctx: commands.Context, command: str = None):
     """Show help information"""
     if command:
-        # Show help for specific command
         cmd_obj = bot.get_command(command)
         if not cmd_obj:
-            await ctx.send(f"❌ Unknown command: `{command}`")
+            await ctx.send(f"Unknown command: `{command}`")
             return
         
         embed = discord.Embed(title=f"Help: `{COMMAND_PREFIX}{command}`", color=0x3498db)
@@ -1274,11 +1225,9 @@ async def cmd_help(ctx: commands.Context, command: str = None):
         await ctx.send(embed=embed)
         return
     
-    # General help
-    embed = discord.Embed(title="🤖 Term Tracker Bot Help", color=0x3498db)
+    embed = discord.Embed(title="Term Tracker Bot Help", color=0x3498db)
     embed.description = "Track and count mentions of specific terms across your server!"
     
-    # Basic commands
     basic = [
         f"`{COMMAND_PREFIX}terms` - List tracked terms",
         f"`{COMMAND_PREFIX}stats [term]` - Show statistics",
@@ -1286,9 +1235,8 @@ async def cmd_help(ctx: commands.Context, command: str = None):
         f"`{COMMAND_PREFIX}leaderboard [timeframe]` - User rankings",
         f"`{COMMAND_PREFIX}search <query>` - Search messages"
     ]
-    embed.add_field(name="📊 Basic Commands", value="\n".join(basic), inline=False)
+    embed.add_field(name="Basic Commands", value="\n".join(basic), inline=False)
     
-    # Admin commands
     admin = [
         f"`{COMMAND_PREFIX}track <term>` - Start tracking a term",
         f"`{COMMAND_PREFIX}untrack <term>` - Stop tracking a term",
@@ -1297,35 +1245,40 @@ async def cmd_help(ctx: commands.Context, command: str = None):
         f"`{COMMAND_PREFIX}ignore_channel [channel]` - Ignore channel",
         f"`{COMMAND_PREFIX}reset [term]` - Reset statistics"
     ]
-    embed.add_field(name="⚙️ Admin Commands", value="\n".join(admin), inline=False)
+    embed.add_field(name="Admin Commands", value="\n".join(admin), inline=False)
     
-    embed.add_field(name="💡 Tips", 
-                    value="• Use word boundaries for exact matches\n• Set cooldowns to prevent spam\n• Ignore command channels to avoid false positives", 
+    moderation = [
+        f"`{COMMAND_PREFIX}mod` - List all moderation actions",
+        f"`{COMMAND_PREFIX}mod help` - Show moderation help",
+        f"`{COMMAND_PREFIX}mod_set <phrase> <action> [value]` - Set action",
+        f"`{COMMAND_PREFIX}mod_remove <phrase>` - Remove action"
+    ]
+    embed.add_field(name="Moderation Commands", value="\n".join(moderation), inline=False)
+    
+    embed.add_field(name="Example Moderation Setup", 
+                    value=f"`{COMMAND_PREFIX}mod_set \"who is\" response \"I don't know, who are you asking about?\"`", 
                     inline=False)
     
     embed.set_footer(text=f"Use {COMMAND_PREFIX}help <command> for detailed help")
     await ctx.send(embed=embed)
 
 # Power user commands
-def check_power(ctx: commands.Context) -> bool:
-    return is_power_user(ctx.author)
-
 @bot.command(name="pu_guilds")
-@commands.check(check_power)
+@commands.check(lambda ctx: is_power_user(ctx.author))
 async def cmd_pu_guilds(ctx: commands.Context):
     """[Power User] List all guilds the bot is in"""
     lines = [f"{g.name} — {g.id} ({g.member_count} members)" for g in bot.guilds]
     if not lines:
         await ctx.send("Bot is not in any guilds.")
     else:
-        embed = discord.Embed(title="🏰 Bot Guilds", color=0xe67e22)
+        embed = discord.Embed(title="Bot Guilds", color=0xe67e22)
         embed.description = "\n".join(lines[:50])
         if len(lines) > 50:
             embed.set_footer(text=f"Showing first 50 of {len(lines)} guilds")
         await ctx.send(embed=embed)
 
 @bot.command(name="pu_all_terms")
-@commands.check(check_power)
+@commands.check(lambda ctx: is_power_user(ctx.author))
 async def cmd_pu_all_terms(ctx: commands.Context, limit: int = 20):
     """[Power User] Show global term statistics"""
     limit = max(1, min(100, limit))
@@ -1336,34 +1289,13 @@ async def cmd_pu_all_terms(ctx: commands.Context, limit: int = 20):
     ) as cur:
         async for r in cur:
             rows.append(r)
+    
     if not rows:
         await ctx.send("No data yet.")
         return
     
-    embed = discord.Embed(title="🌍 Global Top Terms", color=0x9b59b6)
+    embed = discord.Embed(title="Global Top Terms", color=0x9b59b6)
     lines = [f"{i+1}. `{t}` — {c:,}" for i, (t, c) in enumerate(rows)]
-    embed.description = "\n".join(lines)
-    await ctx.send(embed=embed)
-
-@bot.command(name="pu_all_stats")
-@commands.check(check_power)
-async def cmd_pu_all_stats(ctx: commands.Context, term: str, limit: int = 20):
-    """[Power User] Show global user stats for a term"""
-    term = normalize_term(term)
-    limit = max(1, min(100, limit))
-    rows = []
-    async with bot.db.execute(
-        "SELECT user_name, SUM(count) AS total FROM hits WHERE term=? GROUP BY user_id, user_name ORDER BY total DESC LIMIT ?",
-        (term, limit)
-    ) as cur:
-        async for r in cur:
-            rows.append(r)
-    if not rows:
-        await ctx.send(f"No data yet for `{term}` across all guilds.")
-        return
-    
-    embed = discord.Embed(title=f"🌍 Global Users for `{term}`", color=0x9b59b6)
-    lines = [f"{i+1}. **{user}** — {c:,}" for i, (user, c) in enumerate(rows)]
     embed.description = "\n".join(lines)
     await ctx.send(embed=embed)
 
@@ -1371,16 +1303,16 @@ async def cmd_pu_all_stats(ctx: commands.Context, term: str, limit: int = 20):
 @bot.event
 async def on_command_error(ctx: commands.Context, error):
     if isinstance(error, commands.CommandNotFound):
-        return  # Ignore unknown commands
+        return
     elif isinstance(error, commands.CheckFailure):
-        await ctx.send("❌ You don't have permission to use this command.")
+        await ctx.send("You don't have permission to use this command.")
     elif isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send(f"❌ Missing required argument. Use `{COMMAND_PREFIX}help {ctx.command.name}` for usage.")
+        await ctx.send(f"Missing required argument. Use `{COMMAND_PREFIX}help {ctx.command.name}` for usage.")
     elif isinstance(error, commands.BadArgument):
-        await ctx.send(f"❌ Invalid argument. Use `{COMMAND_PREFIX}help {ctx.command.name}` for usage.")
+        await ctx.send(f"Invalid argument. Use `{COMMAND_PREFIX}help {ctx.command.name}` for usage.")
     else:
         log.error("Command error in %s: %s", ctx.command, error, exc_info=error)
-        await ctx.send("❌ An error occurred while processing your command.")
+        await ctx.send("An error occurred while processing your command.")
 
 # -------------------------
 # Entrypoint
@@ -1389,13 +1321,14 @@ def main():
     token = os.getenv("DISCORD_TOKEN")
     if not token:
         raise SystemExit("DISCORD_TOKEN not set in .env")
-    # SSL workaround for some hosts
+    
     try:
         import certifi
         os.environ.setdefault("SSL_CERT_FILE", certifi.where())
         os.environ.setdefault("REQUESTS_CA_BUNDLE", certifi.where())
     except Exception:
         pass
+    
     bot.run(token, reconnect=True)
 
 if __name__ == "__main__":
