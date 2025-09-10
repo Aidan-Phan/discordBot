@@ -548,22 +548,25 @@ def home():
 @app.get("/ui/guilds")
 def ui_guilds():
     db = get_db()
-    rows = db.execute(
-        """
-      SELECT guild_id,
-             COUNT(DISTINCT tm.term) AS terms,
-             COALESCE(SUM(tm.total_count),0) AS mentions,
-             COUNT(DISTINCT tc.category_name) AS categories,
-             COUNT(DISTINCT h.user_id) AS active_users,
-             MAX(m.created_at) AS last_activity
+    rows = get_db().execute("""
+      SELECT
+        tm.guild_id AS guild_id,
+        (SELECT COUNT(DISTINCT term)
+          FROM term_meta tm2
+          WHERE tm2.guild_id = tm.guild_id) AS terms,
+        (SELECT COALESCE(SUM(total_count),0)
+          FROM term_meta tm2
+          WHERE tm2.guild_id = tm.guild_id) AS mentions,
+        (SELECT COUNT(DISTINCT category_name)
+          FROM term_categories tc2
+          WHERE tc2.guild_id = tm.guild_id) AS categories,
+        (SELECT COUNT(DISTINCT alias)
+          FROM term_aliases ta2
+          WHERE ta2.guild_id = tm.guild_id) AS aliases
       FROM term_meta tm
-      LEFT JOIN term_categories tc ON tm.guild_id = tc.guild_id  
-      LEFT JOIN hits h ON tm.guild_id = h.guild_id
-      LEFT JOIN messages m ON tm.guild_id = m.guild_id
-      GROUP BY guild_id
+      GROUP BY tm.guild_id
       ORDER BY mentions DESC
-    """
-    ).fetchall()
+    """).fetchall()
     
     # Get total stats
     total_guilds = len(rows)
