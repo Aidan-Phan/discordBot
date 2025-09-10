@@ -3,8 +3,7 @@ import re
 import json
 import logging
 import asyncio
-from datetime import datetime, timezone, timedelta
-from datetime import time as dtime
+from datetime import datetime, timedelta, timezone, time
 from typing import List, Tuple, Dict, Optional
 
 import discord
@@ -510,7 +509,7 @@ class TermBot(commands.Bot):
         
         await self.db.commit()
 
-    @tasks.loop(time=datetime.time(hour=9, minute=0))  # 9 AM daily
+    @tasks.loop(time=time(hour=9, minute=0, tzinfo=timezone.utc))  # 9 AM UTC daily
     async def daily_summary_task(self):
         """Send daily summaries to guilds that have it enabled"""
         yesterday = datetime.now(timezone.utc) - timedelta(days=1)
